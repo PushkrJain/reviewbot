@@ -4,3 +4,6 @@ __pycache__/
 *.env
 config/secrets.env
 *.pem
+venv/
+__pycache__/
+*.pyc

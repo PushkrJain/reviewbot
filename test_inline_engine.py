@@ -4,7 +4,7 @@ import os
 from agents.rule_engine_agent import get_violations_from_llm
 from agents.inline_comment_agent import annotate_file_with_comments
 
-TEST_FOLDER = "tests/samples"
+TEST_FOLDER = "tests"
 ANNOTATED_FOLDER = os.path.join(TEST_FOLDER, "annotated")
 
 def detect_language(filename):

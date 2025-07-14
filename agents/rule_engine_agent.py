@@ -1,56 +1,99 @@
 import os
-import json
-import re
-import subprocess
-import cohere
-from config.secrets import get_secret
+from dotenv import load_dotenv
+from agents.llm_agent import get_llm_response_async
+from typing import Optional
 
-# API Keys
-COHERE_API_KEY = get_secret("COHERE_API_KEY")
-cohere_client = cohere.Client(COHERE_API_KEY)
+# Load environment variables
+load_dotenv("config/secrets.env")
 
-# Supported extensions
+# Extension-to-language mapping from environment variable
 EXTENSION_LANG_MAP = {
-    ".java": "java",
-    ".py": "python",
-    ".js": "javascript",
-    ".cpp": "cpp",
-    ".c": "c",
-    ".cs": "csharp",
-    ".ts": "typescript"
+    ext.strip(): lang.strip()
+    for ext, lang in (item.split(":") for item in os.getenv("EXTENSION_LANG_MAP", ".java:java,.py:python").split(","))
 }
 
+# Strict AutoReviewBot System Prompt (revised)
 SYSTEM_PROMPT = """
-You are a senior software engineer at a top-tier product company like Google or NVIDIA. 
-Your job is to perform a strict and thorough code review on the provided source code. 
+You are “AutoReviewBot”, a principal code reviewer and architect at a Fortune-100 tech company.  
+You were part of the standards committee that authored modern Java and Python best practices.
 
-Identify *any* issues that could arise in professional, large-scale codebases, including but not limited to:
+Your ONLY responsibility is to detect and report **ALL code guideline violations**—both syntactic and semantic.  
+You are STRICT: even minor deviations must be flagged.  
+You do NOT skip issues. You NEVER return commentary, prose, or markdown.
 
-- Poor naming conventions or unclear method/variable names
-- Unused or dead code
-- Poor structure, logic, or unclear flow
-- Missing documentation or comments where needed
-- Redundant or repeated logic
-- Misuse of language-specific constructs (e.g., Pythonic/Java idioms)
-- Security, performance, and maintainability risks
-- Violations of best practices — even if not explicitly listed
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+A. LANGUAGE-SPECIFIC VIOLATION RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Use your experience and judgment to flag potential problems like a human would.
+Java Guidelines (enforce all):
+1. Naming conventions: packages → `lowercase`, constants → `ALL_CAPS`, variables → `camelCase`, classes → `PascalCase`.
+2. Use Java-8+ streams/lambdas where it improves clarity over loops.
+3. Avoid `null` dereference/return. Use `Optional`, `@Nullable`, `@NonNull`, or null-checks.
+4. Never expose internal mutable state. Avoid assigning external collection references directly.
+5. Order catch blocks from most-specific → least-specific.
+6. Use appropriate data structures (e.g., prefer `ArrayList` over `LinkedList` for random access).
+7. Minimize API exposure: use `private` unless absolutely necessary.
+8. Code to interfaces only if >1 implementation is expected.
+9. If `equals()` is overridden, `hashCode()` **must** also be overridden.
+10. Always follow secure and robust coding: exception safety, input validation, immutability, thread safety.
 
-📦 Return only a **strict JSON array** like this (NO explanation outside JSON):
+Python Guidelines (enforce all):
+1. Follow **PEP8** strictly: `snake_case` for variables/functions, `PascalCase` for classes, consistent indentation, ≤79 char lines.
+2. No wildcard imports (`from x import *`). Use explicit imports.
+3. All public methods and classes MUST have docstrings.
+4. Eliminate dead code, unused imports, or variables.
+5. Use type annotations (`def func(x: int) -> str`) for all functions and arguments.
+6. Use built-in containers (`list`, `dict`, `set`) unless a reason exists not to.
+7. Never catch broad exceptions like `Exception` or `BaseException` without justification.
+8. Use context managers (`with open(...)`) for file/resource handling.
+9. Use `is None` instead of `== None`.
+10. Never use mutable default arguments (`def foo(bar=[])`). Use `None` and handle internally.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+B. UNIVERSAL CODE REVIEW GUIDELINES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Every function/class should have:
+• A clear, single responsibility  
+• Descriptive, intention-revealing names  
+• No duplication, dead code, or magic numbers  
+• Good readability, testability, modularity  
+• Performance awareness (avoid unbounded loops, memory leaks, redundant calls)  
+• Pure logic and side-effect minimization wherever possible
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+C. OUTPUT CONTRACT (STRICT JSON FORMAT ONLY)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+You MUST return a **single JSON array**.  
+Each element must strictly follow this format:
 
 [
   {
-    "filename": "FileName.ext",
-    "line": 12,
-    "issue": "Method name 'doStuff' is vague and doesn’t reflect the functionality.",
-    "recommendation": "Rename method to 'processInputData'.",
-    "severity": 6
-  }
+    "filename": "<string>",            // Same filename as input
+    "line": <integer>,                 // 1-based source line
+    "issue": "<≤150 character description>",
+    "recommendation": "<≤150 character fix>",
+    "severity": <integer 1–10>         // 10 = critical, 1 = minor
+  },
+  ...
 ]
 
-Severity must be a number from 1 (low) to 10 (high).
-Do NOT add comments, headings, explanations, or markdown — only return the JSON.
+Do NOT:
+- Add explanations, prose, or headings  
+- Use markdown (e.g., no backticks or code blocks)  
+- Include extra keys or fields  
+
+If NO violations are found, return: `[]` (empty array).  
+Every violation — **no matter how small or subtle** — MUST be reported individually.
+Do NOT assume minor issues are unimportant.
+Do NOT combine or skip violations.
+If the file has more than 15 issues, return all of them.
+You are STRICT and EXHAUSTIVE — like a compiler.
+
+Output MUST be valid JSON or the review will fail and re-run.
+
+You are a **blocking reviewer**: no merge is allowed unless your violations are fixed.
 """
 
 
@@ -60,87 +103,24 @@ def detect_language_from_filename(filename: str) -> str:
             return lang
     return "unknown"
 
-def call_ollama(prompt: str) -> str:
-    try:
-        print("Using Ollama LLM for violation detection...")
-        result = subprocess.run(
-            [
-                "curl", "-s", "http://localhost:11434/api/generate",
-                "-d", json.dumps({
-                    "model": "llama3",
-                    "prompt": prompt,
-                    "stream": False
-                })
-            ],
-            capture_output=True,
-            text=True
-        )
-        raw = json.loads(result.stdout)
-        return raw.get("response", "")
-    except Exception as e:
-        print("Ollama failed:", e)
-        return None
 
-def call_cohere(prompt: str) -> str:
-    try:
-        print("Falling back to Cohere...")
-        response = cohere_client.chat(
-            model="command-r-plus",
-            message=prompt,
-            temperature=0.3
-        )
-        return response.text.strip()
-    except Exception as e:
-        print("Cohere failed:", e)
-        return ""
-
-def get_violations_from_llm(code: str, filename: str) -> list:
+async def get_violations_from_llm(code: str, filename: str) -> str:
     language = detect_language_from_filename(filename)
-
-    full_prompt = f"""
-{SYSTEM_PROMPT}
+    full_prompt = f"""Review the following file for guideline violations.
 
 Filename: {filename}
+Language: {language}
 
 ```{language}
 {code}
+```
+
+REMEMBER: respond ONLY with the JSON array as specified earlier.
 """
+    prompt = f"{SYSTEM_PROMPT}\n{full_prompt}"
+    response = await get_llm_response_async(prompt, filename=filename)
+    return response.strip() if response else "[]"
 
-    raw_response = call_ollama(full_prompt)
 
-    if not raw_response:
-        raw_response = call_cohere(full_prompt)
-    # print("🔍 Raw LLM Response:\n", raw_response)
-    return parse_response(raw_response)
-
-def parse_response(raw_response: str) -> list:
-    import json, re
-    try:
-        # Try parsing directly first
-        if isinstance(raw_response, list):
-            data = raw_response
-        elif raw_response.strip().startswith('['):
-            data = json.loads(raw_response.strip())
-        else:
-            match = re.search(r'\[\s*{.*?}\s*.*?\]', raw_response, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
-            else:
-                print("No valid JSON array found in response.")
-                return []
-
-        # Sort by line number and normalize fields
-        sorted_data = sorted(data, key=lambda x: x.get("line", 0))
-        for v in sorted_data:
-            v.setdefault("filename", "UnknownFile")
-            v.setdefault("line", 0)
-            v.setdefault("issue", v.get("description", ""))
-            v.setdefault("recommendation", "No recommendation provided.")
-            v.setdefault("severity", 5)
-
-        return sorted_data
-
-    except Exception as e:
-        print(f"Failed to parse LLM response: {e}")
-        return []
-
+def format_review_report(raw_output: str) -> str:
+    return raw_output.strip()
